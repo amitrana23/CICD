@@ -1,0 +1,55 @@
+node {
+    def app = "aceest-fitness"
+    def dockerUser = "your-dockerhub-username"
+    def imageTag = ""
+    def blueDeployment = "aceest-blue"
+    def greenDeployment = "aceest-green"
+    def namespace = "aceest"
+
+    stage('Checkout') { checkout scm }
+    stage('Unit Tests') { sh 'pytest -q' }
+    stage('SonarQube Analysis') {
+        withSonarQubeEnv('SonarServer') {
+            sh 'sonar-scanner -Dsonar.projectKey=ACEestFitness'
+        }
+        timeout(time: 2, unit: 'MINUTES') {
+            waitForQualityGate abortPipeline: true
+        }
+    }
+    stage('Build Docker Image') {
+        def gitHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        imageTag = "${dockerUser}/${app}:${gitHash}"
+        sh "docker build -t ${imageTag} ."
+    }
+    stage('Push Docker Image') {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials-id', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+            sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+            sh "docker push ${imageTag}"
+        }
+    }
+    stage('Deploy to Green Environment') {
+        withCredentials([file(credentialsId: 'kubeconfig-credentials-id', variable: 'KUBECONFIG_FILE')]) {
+            sh 'mkdir -p $HOME/.kube && cp $KUBECONFIG_FILE $HOME/.kube/config'
+            sh "kubectl set image deployment/${greenDeployment} ${app}=${imageTag} -n ${namespace} --record || true"
+            sh "kubectl rollout status deployment/${greenDeployment} -n ${namespace}"
+        }
+    }
+    stage('Verify Green Environment') {
+        sh '''
+        GREEN_POD=$(kubectl get pods -n aceest -l app=aceest-fitness,color=green -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n aceest $GREEN_POD -- curl -s http://localhost:5000/health || exit 1
+        '''
+    }
+    stage('Promote Green -> Live') {
+        input message: 'Approve promotion to production?'
+        sh "kubectl -n ${namespace} patch svc aceest-svc -p '{"spec":{"selector":{"app":"${app}","color":"green"}}}'"
+    }
+    stage('Cleanup Blue') {
+        sh "kubectl -n ${namespace} scale deployment/${blueDeployment} --replicas=0 || true"
+    }
+    post {
+        failure {
+            sh 'kubectl -n aceest patch svc aceest-svc -p "{\"spec\":{\"selector\":{\"app\":\"aceest-fitness\",\"color\":\"blue\"}}}"'
+        }
+    }
+}
